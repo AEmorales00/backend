@@ -1,83 +1,114 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { PrismaClient } from '@prisma/client';
-import { createSaleSchema } from './sales.schema';
+import { authenticate, requireRoles } from '../../core/middlewares';
 
 const router = Router();
 const prisma = new PrismaClient();
 
-// Crear venta
-router.post('/', async (req, res) => {
-  const parsed = createSaleSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ message: 'Datos inválidos', errors: parsed.error.flatten() });
+async function canReadSale(req: any, res: Response, next: NextFunction) {
+  const id = Number(req.params.id ?? req.query.saleId)
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ message: 'ID inválido' })
+  const sale = await prisma.sale.findUnique({ where: { id }, select: { id: true, userId: true } })
+  if (!sale) return res.status(404).json({ message: 'Venta no encontrada' })
+  const roles: string[] = req.user?.roles ?? (req.user?.role ? [req.user.role] : [])
+  if (roles.includes('ADMIN') || roles.includes('JEFE')) return next()
+  if (sale.userId === req.user?.sub) return next()
+  return res.status(403).json({ message: 'No puedes ver esta venta' })
+}
+
+// Crear venta con snapshot de costo/precio (acepta qty o quantity)
+router.post('/', authenticate, requireRoles('ADMIN','VENDEDOR'), async (req: any, res: any) => {
+  const rawItems: Array<any> = Array.isArray(req.body?.items) ? req.body.items : []
+  if (!rawItems.length) return res.status(400).json({ message: 'items requerido' })
+
+  const items = rawItems.map((i) => ({
+    productId: Number(i.productId),
+    qty: Number(i.qty ?? i.quantity ?? 0),
+    price: (i.price != null) ? Number(i.price) : undefined,
+  }))
+  if (!items.every((i) => Number.isFinite(i.productId) && i.productId > 0 && Number.isFinite(i.qty) && i.qty > 0)) {
+    return res.status(400).json({ message: 'items inválidos' })
   }
 
-  const { items } = parsed.data;
+  const ids = Array.from(new Set(items.map(i => i.productId)))
+  const products = await prisma.product.findMany({ where: { id: { in: ids }, active: true } })
+  const map = new Map(products.map(p => [p.id, p]))
 
-  // Cargar productos involucrados
-  const productIds = Array.from(new Set(items.map((i) => i.productId)));
-  const products = await prisma.product.findMany({ where: { id: { in: productIds }, active: true } });
-  const map = new Map(products.map((p) => [p.id, p]));
-
-  // Validaciones de existencia y stock
-  for (const i of items) {
-    const p = map.get(i.productId);
-    if (!p) return res.status(400).json({ message: `Producto ${i.productId} no existe o está inactivo` });
-    if (p.stock < i.quantity) {
-      return res.status(400).json({ message: `Stock insuficiente para producto ${p.id}` });
-    }
+  // validar existencia y stock
+  for (const it of items) {
+    const p = map.get(it.productId)
+    if (!p) return res.status(400).json({ message: `Producto ${it.productId} no existe o está inactivo` })
+    if (p.stock < it.qty) return res.status(400).json({ message: `Stock insuficiente para producto ${p.id}` })
   }
 
-  // Calcular precios y totales
-  const computed = items.map((i) => {
-    const p = map.get(i.productId)!;
-    const price = i.price ?? Number(p.price);
-    const subtotal = Number((price * i.quantity).toFixed(2));
-    return { ...i, price, subtotal };
-  });
-  const total = Number(computed.reduce((acc, i) => acc + i.subtotal, 0).toFixed(2));
+  let total = 0
+  const saleItems = items.map(i => {
+    const p: any = map.get(i.productId)
+    const price = i.price ?? Number(p.price)
+    const subtotal = Number((price * i.qty).toFixed(2))
+    total += subtotal
+    return { productId: p.id, qty: i.qty, quantity: i.qty, price, cost: Number(p.cost), subtotal }
+  })
 
   try {
-    const result = await prisma.$transaction(async (tx) => {
-      const sale = await tx.sale.create({ data: { total } });
-
-      await tx.saleItem.createMany({
-        data: computed.map((i) => ({
-          saleId: sale.id,
-          productId: i.productId,
-          quantity: i.quantity,
-          price: i.price,
-          subtotal: i.subtotal,
-        })),
-      });
-
-      // Descontar stock
-      for (const i of computed) {
-        await tx.product.update({
-          where: { id: i.productId },
-          data: { stock: { decrement: i.quantity } },
-        });
+    const sale = await prisma.$transaction(async tx => {
+      for (const it of saleItems) {
+        await tx.product.update({ where: { id: it.productId }, data: { stock: { decrement: it.qty } } })
       }
-
-      return sale;
-    });
-
-    res.status(201).json({ id: result.id, total });
+      return tx.sale.create({
+        data: { userId: req.user.sub, total, items: { createMany: { data: saleItems } } },
+        include: { items: true },
+      })
+    })
+    res.json(sale)
   } catch (e) {
-    console.error('Error al registrar venta:', e);
-    res.status(500).json({ message: 'Error al registrar venta' });
+    console.error('Error al registrar venta:', e)
+    res.status(500).json({ message: 'Error al registrar venta' })
   }
-});
+})
 
 // Listar ventas (resumen)
-router.get('/', async (_req, res) => {
-  const sales = await prisma.sale.findMany({ orderBy: { createdAt: 'desc' } });
-  const out = sales.map((s) => ({ id: s.id, createdAt: s.createdAt, total: parseFloat(s.total.toString()) }));
-  res.json(out);
-});
+router.get('/', authenticate, requireRoles('ADMIN','JEFE','VENDEDOR'), async (req: any, res) => {
+  const q: any = req.query || {}
+  const page = Number(q.page || 0)
+  const limit = Number(q.limit || 0)
+  const from = q.from ? new Date(String(q.from)) : null
+  const to = q.to ? new Date(String(q.to) + 'T23:59:59') : null
+
+  const where: any = {}
+  if (from || to) where.createdAt = { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) }
+
+  // Si es vendedor (y no Admin/JEFE), mostrar solo sus ventas
+  const roles: string[] = req.user?.roles ?? []
+  const isAdminOrBoss = roles.includes('ADMIN') || roles.includes('JEFE')
+  if (!isAdminOrBoss) where.userId = req.user.sub
+
+  const usePaged = (page > 0 || limit > 0 || from || to)
+  if (usePaged) {
+    const p = page > 0 ? page : 1
+    const take = limit > 0 ? Math.min(limit, 100) : 20
+    const skip = (p - 1) * take
+    const [total, rows] = await (prisma as any).$transaction([
+      prisma.sale.count({ where }),
+      prisma.sale.findMany({ where, include: { user: true, items: true }, orderBy: { id: 'desc' }, skip, take }),
+    ])
+    const data = rows.map((s: any) => ({
+      id: s.id,
+      createdAt: s.createdAt,
+      userName: s.user?.name ?? '',
+      total: Number(s.total),
+      items: s.items.map((it: any) => ({ productId: it.productId, price: Number(it.price), quantity: it.quantity ?? it.qty ?? 0, subtotal: Number(it.subtotal) })),
+    }))
+    return res.json({ data, total })
+  }
+
+  const sales = await prisma.sale.findMany({ where, orderBy: { createdAt: 'desc' } })
+  const out = sales.map((s) => ({ id: s.id, createdAt: s.createdAt, total: parseFloat(s.total.toString()) }))
+  res.json(out)
+})
 
 // Obtener venta por id (con items)
-router.get('/:id', async (req, res) => {
+router.get('/:id', authenticate, requireRoles('ADMIN','JEFE','VENDEDOR'), canReadSale, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ message: 'ID inválido' });
   try {
@@ -110,6 +141,16 @@ router.get('/:id', async (req, res) => {
   }
 });
 
+// Ventas del usuario autenticado
+router.get('/my', authenticate, requireRoles('ADMIN','VENDEDOR'), async (req: any, res: any) => {
+  const sales = await prisma.sale.findMany({
+    where: { userId: req.user.sub },
+    include: { items: true },
+    orderBy: { id: 'desc' },
+  })
+  res.json(sales)
+})
+
 export async function getSaleItems(req: Request, res: Response) {
   const idRaw = req.params.id ?? req.query.saleId;
   const id = Number(idRaw);
@@ -136,7 +177,7 @@ export async function getSaleItems(req: Request, res: Response) {
 }
 
 // Aliases dentro de /sales
-router.get('/:id/items', getSaleItems);
-router.get('/items', getSaleItems);
+router.get('/:id/items', authenticate, requireRoles('ADMIN','JEFE','VENDEDOR'), canReadSale as any, getSaleItems);
+router.get('/items', authenticate, requireRoles('ADMIN','JEFE'), getSaleItems);
 
 export default router;

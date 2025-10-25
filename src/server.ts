@@ -18,4 +18,24 @@ const server = app.listen(PORT, HOST, () => {
 
 server.on('error', (err) => {
   console.error('Server error:', err);
+  process.exit(1);
 });
+
+// Graceful shutdown
+const shutdown = () => {
+  console.log('\nShutting down gracefully...');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+  
+  // Force close after 5 seconds
+  setTimeout(() => {
+    console.error('Forcing shutdown');
+    process.exit(1);
+  }, 5000);
+};
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+process.on('SIGUSR2', shutdown); // For nodemon restarts
